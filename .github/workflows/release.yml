@@ -1,0 +1,85 @@
+name: Publish libGDX Android natives
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Package ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Resolve libGDX version
+        id: version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag must name a libGDX version, for example 1.9.10 or v1.9.10"
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download and stage natives
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+
+          base="https://repo1.maven.org/maven2/com/badlogicgames/gdx"
+          staging="$RUNNER_TEMP/libgdx-${VERSION}"
+          mkdir -p "$staging"
+
+          # libGDX 1.9.x has armeabi; newer releases may not. A missing jar is skipped with a warning
+          # so a tag such as 1.12.1 still produces a usable archive for the ABIs it does ship.
+          for abi in armeabi armeabi-v7a arm64-v8a x86 x86_64; do
+            mkdir -p "$staging/$abi"
+
+            for artifact in gdx-platform gdx-freetype-platform; do
+              url="$base/$artifact/$VERSION/$artifact-$VERSION-natives-$abi.jar"
+              jar="$RUNNER_TEMP/$artifact-$VERSION-$abi.jar"
+
+              if curl -fsSL --retry 5 --retry-delay 2 "$url" -o "$jar"; then
+                unzip -o -j "$jar" '*.so' -d "$staging/$abi"
+              else
+                echo "::warning::native artifact not available: $url"
+              fi
+            done
+
+            if ! find "$staging/$abi" -type f -name '*.so' -print -quit | grep -q .; then
+              rmdir "$staging/$abi"
+            fi
+          done
+
+          if ! find "$staging" -type f -name '*.so' -print -quit | grep -q .; then
+            echo "::error::no libGDX Android natives were downloaded for $VERSION"
+            exit 1
+          fi
+
+          echo "STAGING=$staging" >> "$GITHUB_ENV"
+
+      - name: Zip the ABI folders
+        id: zip
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/libgdx-$VERSION-android.zip"
+          (cd "$STAGING" && zip -r -9 "$archive" .)
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: ${{ steps.zip.outputs.archive }}
